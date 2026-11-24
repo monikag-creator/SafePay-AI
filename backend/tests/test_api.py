@@ -4,22 +4,10 @@ from fastapi.testclient import TestClient
 from app import main
 from app.services.otp import otp_service
 
-class FakeModel:
-    def predict_proba(self, rows):
-        out = []
-        for row in rows:
-            # index 3 is new receiver; keep test outcomes stable while still
-            # exercising the real scoring blend and hard-block rule.
-            p = 0.01 if row[0] < 1000 else (0.50 if row[0] < 50000 else 0.99)
-            out.append([1-p, p])
-        return out
-
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main.config, "DB_PATH", tmp_path / "test.db")
-    monkeypatch.setattr(main, "ensure_model", lambda: None)
-    monkeypatch.setattr(main, "model_data", {"model": FakeModel(), "model_name": "Test model",
-        "features": main.config.FEATURES, "metrics": {"roc_auc": 1.0}})
+    main.ensure_model()
     receiver_events, user_events = main.receiver_events, main.user_events
     receiver_events.clear(); user_events.clear(); otp_service.items.clear()
     with TestClient(main.app) as c:
@@ -40,18 +28,23 @@ def test_allow_decision(client):
     assert response.json()["decision"] == "ALLOW"
 
 def test_verify_decision(client):
-    response = client.post("/api/v1/payments/check", json=request("bob", 3000, {"vpn": True}))
+    response = client.post("/api/v1/payments/check", json=request("bob", 25000))
     assert response.status_code == 200
-    assert response.json()["decision"] == "VERIFY"
+    result = response.json()
+    assert result["decision"] == "VERIFY"
+    assert 40 <= result["risk_score"] <= 69
+    assert result["engine"] == f"FastAPI + {main.model_data['model_name']}"
+    assert "The payment matches your usual pattern" not in result["reasons"]
 
 def test_block_decision(client):
     response = client.post("/api/v1/payments/check", json=request("carol", 60000, {"new_device": True, "emulator": True}))
     assert response.status_code == 200
     assert response.json()["risk_score"] == 100
     assert response.json()["decision"] == "BLOCK"
+    assert "The payment matches your usual pattern" not in response.json()["reasons"]
 
 def test_otp_attempt_limit(client):
-    result = client.post("/api/v1/payments/check", json=request("dave", 3000, {"vpn": True})).json()
+    result = client.post("/api/v1/payments/check", json=request("dave", 10000, {"vpn": True})).json()
     txid = result["transaction_id"]
     sent = client.post("/api/v1/otp/send", json={"user_id": "dave", "transaction_id": txid})
     assert sent.status_code == 200
@@ -61,3 +54,21 @@ def test_otp_attempt_limit(client):
         assert response.status_code == 400
     last = client.post("/api/v1/otp/verify", json={"user_id": "dave", "transaction_id": txid, "otp": sent.json()["otp"]})
     assert last.status_code == 429
+
+def test_verify_sweep_real_model(client):
+    # Each row is an unseen receiver/user. The actual fitted estimator is loaded
+    # by the fixture and each profile must remain in the verification band.
+    for amount in (10_000, 25_000, 50_000):
+        result = client.post("/api/v1/payments/check", json=request(f"sweep_{amount}", amount)).json()
+        assert result["decision"] == "VERIFY", (amount, result)
+        assert 40 <= result["risk_score"] <= 69
+    for amount in (1_000, 5_000, 25_000, 50_000):
+        user = f"vpn_{amount}"
+        payload = request(user, 500)
+        payload["receiver_id"] = f"receiver-{amount}@bank"
+        assert client.post("/api/v1/payments/check", json=payload).status_code == 200
+        payload = request(user, amount, {"vpn": True})
+        payload["receiver_id"] = f"receiver-{amount}@bank"
+        result = client.post("/api/v1/payments/check", json=payload).json()
+        assert result["decision"] == "VERIFY", (amount, result)
+        assert 40 <= result["risk_score"] <= 69

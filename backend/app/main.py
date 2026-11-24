@@ -94,7 +94,7 @@ def check_payment(req: PaymentCheck):
     receiver_events.setdefault(req.receiver_id, []).append((now, req.user_id))
     user_events.setdefault(req.user_id, []).append(now)
     return {"transaction_id": txid, "risk_score": risk, "decision": decision, "reasons": reasons,
-            "next_step": step, "engine": "FastAPI + XGBoost"}
+            "next_step": step, "engine": f"FastAPI + {model_data['model_name']}"}
 
 @app.post("/api/v1/otp/send")
 def send_otp(req: OTPSend):
